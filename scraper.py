@@ -26,7 +26,9 @@ from config import (
     SEL_COUNTRY_MENU, SEL_IRAN_ITEM, SEL_MORE_BTN,
 )
 
-DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{2,4})")
+DATE_RE = re.compile(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{2,4})")
+# китайский и ISO-форматы: 26年06月11日 / 2026年06月08日 / 2026.06.08 / 2026-06-08
+DATE_RE_YMD = re.compile(r"(?<!\d)(\d{2,4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})")
 
 
 async def human_pause():
@@ -35,11 +37,16 @@ async def human_pause():
 
 
 def parse_card_date(text: str):
-    """Достаёт дату вида 08.06.26 (или 08.06.2026) из строки карточки."""
-    m = DATE_RE.search(text or "")
-    if not m:
-        return None
-    d, mo, y = m.groups()
+    """Достаёт дату: 08.06.26 / 08.06.2026 / 2026.06.08 / 2026年06月08日."""
+    text = text or ""
+    m = DATE_RE.search(text)
+    if m:
+        d, mo, y = m.groups()
+    else:
+        m = DATE_RE_YMD.search(text)
+        if not m:
+            return None
+        y, mo, d = m.groups()
     y = int(y)
     if y < 100:
         y += 2000
@@ -86,7 +93,8 @@ async def extract_cards(page, base_url):
             continue  # одна новость встречается и в слайдере, и в ленте
         seen_urls.add(url)
         cards.append({"title": item["title"], "url": url,
-                      "date": parse_card_date(item["top"])})
+                      "date": parse_card_date(item["top"]),
+                      "raw_top": item["top"]})
     return cards
 
 
@@ -141,9 +149,13 @@ async def collect_language(context, lang, url, cutoff, log):
             cards = await extract_cards(page, url)
             dated = [c for c in cards if c["date"]]
             oldest = min((c["date"] for c in dated), default=None)
-            await log(f"[{lang}] Вижу карточек: {len(cards)}; "
-                      f"самая старая: {oldest:%d.%m.%Y}" if oldest else
-                      f"[{lang}] Вижу карточек: {len(cards)}; дат не распознал")
+            if oldest:
+                await log(f"[{lang}] Вижу карточек: {len(cards)}; "
+                          f"самая старая: {oldest:%d.%m.%Y}")
+            else:
+                sample = cards[0]["raw_top"] if cards else ""
+                await log(f"[{lang}] Вижу карточек: {len(cards)}; дат не "
+                          f"распознал (пример сырой даты: {sample!r})")
 
             if oldest and oldest < cutoff:
                 break  # дошли до новостей старше 10 дней
