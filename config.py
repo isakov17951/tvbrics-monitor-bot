@@ -48,7 +48,11 @@ IRAN_DATA_ID = "784184"
 SEL_COUNTRY_MENU = "li.js_country_parent"                                  # кнопка "Страны-участницы"
 SEL_IRAN_ITEM = f'li.js_country_change_news[data-id="{IRAN_DATA_ID}"]'    # пункт "Иран"
 SEL_NEWS_CONTAINER = "#items_container_news"                               # контейнер отфильтрованной ленты
-SEL_CARD = "div.news-item__content"                                        # общий блок карточки: есть и в слайдере, и в нижнем списке
+# Карточки ищем ТОЛЬКО в зонах, подчиняющихся фильтру страны:
+# основная лента (#items_container_news) и верхний слайдер. Боковые блоки
+# типа "BRICS LIFE" фильтру не подчиняются и потому исключены.
+SEL_CARD = ("#items_container_news div.news-item__content, "
+            ".news__center-column-slider div.news-item__content")
 SEL_CARD_TITLE = "div.news-item__name"                                     # заголовок (внутри — <a href>)
 SEL_CARD_TOP = "div.news-item__top"                                        # строка "08.06.26 • 18:15 • Рубрика"
 SEL_MORE_BTN = "div.js-news-more-btn a.btn-white"                          # кнопка "ЕЩЕ"
