@@ -43,6 +43,8 @@ def parse_card_date(text: str):
     y = int(y)
     if y < 100:
         y += 2000
+    elif y > 2099:  # склейка даты со временем: "07.06.2610" = 07.06.26 + 10:30
+        y = 2000 + int(str(y)[:2])
     try:
         return datetime(y, int(mo), int(d))
     except ValueError:
@@ -57,10 +59,20 @@ async def extract_cards(page, base_url):
             const name = c.querySelector(args.title);
             const a = name ? name.querySelector('a') : c.querySelector('a');
             const top = c.querySelector(args.top);
+            let dateText = '';
+            if (top) {
+                for (const n of top.childNodes) {
+                    if (n.nodeType === 3 && n.textContent.trim()) {
+                        dateText = n.textContent.trim();
+                        break;
+                    }
+                }
+                if (!dateText) dateText = top.textContent.trim();
+            }
             return {
                 title: name ? name.textContent.trim() : '',
                 href: a ? a.getAttribute('href') : '',
-                top: top ? top.textContent.trim() : ''
+                top: dateText
             };
         })""",
         {"title": SEL_CARD_TITLE, "top": SEL_CARD_TOP},
@@ -124,6 +136,7 @@ async def collect_language(context, lang, url, cutoff, log):
         await human_pause()
 
         # --- листаем ленту кнопкой "ЕЩЕ" до глубины DAYS_BACK ----------
+        prev_count = None
         for click_n in range(MAX_MORE_CLICKS + 1):
             cards = await extract_cards(page, url)
             dated = [c for c in cards if c["date"]]
@@ -134,6 +147,13 @@ async def collect_language(context, lang, url, cutoff, log):
 
             if oldest and oldest < cutoff:
                 break  # дошли до новостей старше 10 дней
+
+            if prev_count is not None and len(cards) <= prev_count:
+                await log(f"[{lang}] После 'ЕЩЕ' новых карточек не появилось — "
+                          "останавливаюсь. Похоже, бот не видит подгружаемую "
+                          "часть ленты, нужна сверка селекторов.")
+                break
+            prev_count = len(cards)
 
             more = page.locator(SEL_MORE_BTN).first
             if await more.count() == 0 or not await more.is_visible():
