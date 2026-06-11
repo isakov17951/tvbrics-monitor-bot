@@ -1,0 +1,37 @@
+name: Экспорт в Excel
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "С какой даты (ДД.ММ.ГГГГ, пусто = весь архив)"
+        required: false
+        default: ""
+      date_to:
+        description: "По какую дату (ДД.ММ.ГГГГ, пусто = по сегодня)"
+        required: false
+        default: ""
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Забрать код и базу
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: pip install -r requirements.txt
+
+      - name: Экспорт и отправка в Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          DATE_FROM: ${{ github.event.inputs.date_from }}
+          DATE_TO: ${{ github.event.inputs.date_to }}
+        run: python export_excel.py
