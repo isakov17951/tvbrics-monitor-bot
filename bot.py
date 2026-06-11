@@ -70,6 +70,8 @@ async def cmd_search(message: Message):
             await message.answer(text)
 
         results = await run_search(log)
+        # от старой новости к новой: читается в чате по хронологии
+        results.sort(key=lambda r: tuple(reversed(r["date"].split("."))))
 
         if not results:
             await message.answer(
