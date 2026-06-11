@@ -10,9 +10,19 @@
 # Значение = красивое имя, которое бот напишет в строке "Партнер:"
 # ----------------------------------------------------------------------
 PARTNERS = {
-    "irna.ir": "IRNA",  # <- ПРИМЕР. Добавляй остальных партнёров по этому образцу:
-    # "mehrnews.com": "Mehr News",
-    # "домен-партнёра": "Имя партнёра",
+    # Корневые домены: бот ловит и сам домен, и все поддомены (en., www., ru. ...)
+    "irna.ir": "IRNA",
+    "mehrnews.com": "Mehr News",
+    "tehrantimes.com": "Tehran Times",
+    "nournews.ir": "Nour News",
+    "parstoday.ir": "Pars Today",
+    "tabnak.ir": "Tabnak",
+    "iranpress.com": "Iran Press",
+    "alalam.ir": "Al Alam",
+    "iribnews.ir": "IRIB News",
+    "presstv.ir": "Press TV",
+    "iribmediatrade.ir": "IRIB Media Trade",
+    "iranradio.ir": "Iran Radio",
 }
 
 # ----------------------------------------------------------------------
@@ -21,11 +31,11 @@ PARTNERS = {
 # ----------------------------------------------------------------------
 LANGS = [
     ("RU", "https://tvbrics.com/news/"),
-   # ("EN", "https://tvbrics.com/en/news/"),
-   # ("CN", "https://tvbrics.com/cn/news/"),
-   # ("PT", "https://tvbrics.com/pt/news/"),
-   # ("ES", "https://tvbrics.com/es/news/"),
-   # ("AR", "https://tvbrics.com/ar/news/"),
+    ("EN", "https://tvbrics.com/en/news/"),
+    ("CN", "https://tvbrics.com/cn/news/"),
+    ("PT", "https://tvbrics.com/pt/news/"),
+    ("ES", "https://tvbrics.com/es/news/"),
+    ("AR", "https://tvbrics.com/ar/news/"),
 ]
 
 # Внутренний номер Ирана на сайте (нашли через "Посмотреть код").
@@ -50,6 +60,6 @@ DAYS_BACK = 10            # глубина поиска в днях
 PAUSE_MIN = 2.0           # пауза между действиями, сек (имитация человека)
 PAUSE_MAX = 3.5
 MAX_MORE_CLICKS = 40      # предохранитель: максимум нажатий "ЕЩЕ" на один язык
-HEADLESS = False           # False = видно окно браузера (удобно для отладки)
+HEADLESS = True           # False = видно окно браузера (удобно для отладки)
 
 DB_PATH = "seen_news.db"  # база уже найденных новостей (в Git не попадает)
