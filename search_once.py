@@ -16,9 +16,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")  # один id или несколько через запятую: 111,222
 if not TOKEN or not CHAT_ID:
     raise SystemExit("Нужны переменные BOT_TOKEN и CHAT_ID")
+CHAT_IDS = [c.strip() for c in CHAT_ID.split(",") if c.strip()]
 
 # На сервере GitHub нет экрана — принудительно включаем невидимый режим,
 # что бы ни стояло в config.py. Делаем это ДО импорта scraper.
@@ -40,17 +41,24 @@ async def main():
         # от старой новости к новой: читается в чате по хронологии
         results.sort(key=lambda r: tuple(reversed(r["date"].split("."))))
 
-        if not results:
-            await bot.send_message(
-                CHAT_ID,
-                "Плановый поиск: новых новостей иранских партнёров "
-                "за последние 10 дней нет.",
-            )
-        else:
-            await bot.send_message(CHAT_ID, f"Найдено новых новостей: {len(results)}")
-            for item in results:
-                await bot.send_message(CHAT_ID, format_news(item))
-                await asyncio.sleep(0.5)
+        for chat_id in CHAT_IDS:
+            try:
+                if not results:
+                    await bot.send_message(
+                        chat_id,
+                        "Плановый поиск: новых новостей иранских партнёров "
+                        "за последние 10 дней нет.",
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id, f"Найдено новых новостей: {len(results)}")
+                    for item in results:
+                        await bot.send_message(chat_id, format_news(item))
+                        await asyncio.sleep(0.5)
+            except Exception as e:
+                # один недоступный получатель (не нажал Start, заблокировал
+                # бота, опечатка в id) не должен лишать сводки остальных
+                print(f"Не смог отправить получателю {chat_id}: {e}", flush=True)
     finally:
         await bot.session.close()
 
