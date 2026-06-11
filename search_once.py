@@ -37,6 +37,8 @@ async def main():
             print(text, flush=True)  # ход работы виден в логе GitHub Actions
 
         results = await run_search(log)
+        # от старой новости к новой: читается в чате по хронологии
+        results.sort(key=lambda r: tuple(reversed(r["date"].split("."))))
 
         if not results:
             await bot.send_message(
