@@ -1,0 +1,41 @@
+name: Поиск новостей иранских партнёров
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # каждый день в 06:00 UTC = 09:00 по Москве
+  workflow_dispatch:        # и кнопка Run workflow на сайте GitHub
+
+permissions:
+  contents: write           # чтобы сохранять базу seen_news.db обратно в репозиторий
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Поиск
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python search_once.py
+
+      - name: Сохранить базу найденного (чтобы не повторяться)
+        run: |
+          git config user.name "tvbrics-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -f seen_news.db
+          git diff --cached --quiet || git commit -m "Обновление базы найденных новостей [skip ci]"
+          git push

@@ -14,6 +14,7 @@ import asyncio
 import os
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
@@ -21,6 +22,7 @@ from scraper import run_search
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+PROXY = os.getenv("PROXY")  # например http://127.0.0.1:10809; пусто = без прокси
 if not TOKEN:
     raise SystemExit("Нет токена! Создай файл .env со строкой BOT_TOKEN=твой_токен")
 
@@ -85,8 +87,10 @@ async def cmd_search(message: Message):
 
 
 async def main():
-    bot = Bot(token=TOKEN)
-    print("Бот запущен. Нажми Ctrl+C для остановки.")
+    session = AiohttpSession(proxy=PROXY) if PROXY else None
+    bot = Bot(token=TOKEN, session=session)
+    print(f"Бот запущен{' через прокси ' + PROXY if PROXY else ''}. "
+          "Нажми Ctrl+C для остановки.")
     await dp.start_polling(bot)
 
 
