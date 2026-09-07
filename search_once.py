@@ -1,67 +1,71 @@
 # -*- coding: utf-8 -*-
-"""
-Одноразовый прогон поиска — для GitHub Actions (по расписанию или Run workflow).
-Делает то же, что кнопка в Telegram, но без ожидания нажатий:
-ищет -> присылает результаты в твой чат -> завершается.
-
-Нужны переменные окружения (на GitHub задаются в Secrets):
-  BOT_TOKEN — токен бота
-  CHAT_ID   — id твоего чата с ботом (узнать: напиши @userinfobot в Telegram)
-"""
-
+"""Разовый поиск для Actions и локальной проверки без Telegram."""
+import argparse
 import asyncio
+import json
 import os
+from dataclasses import asdict
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # один id или несколько через запятую: 111,222
-if not TOKEN or not CHAT_ID:
-    raise SystemExit("Нужны переменные BOT_TOKEN и CHAT_ID")
-CHAT_IDS = [c.strip() for c in CHAT_ID.split(",") if c.strip()]
+load_dotenv(Path(__file__).with_name(".env"))
 
-# На сервере GitHub нет экрана — принудительно включаем невидимый режим,
-# что бы ни стояло в config.py. Делаем это ДО импорта scraper.
-import config  # noqa: E402
-config.HEADLESS = True
-
-from aiogram import Bot  # noqa: E402
+from config import DAYS_BACK, LANGS  # noqa: E402
+from delivery import deliver_report, format_news, format_summary  # noqa: E402
 from scraper import run_search  # noqa: E402
-from bot import format_news  # noqa: E402
 
 
-async def main():
-    bot = Bot(token=TOKEN)
-    try:
-        async def log(text: str):
-            print(text, flush=True)  # ход работы виден в логе GitHub Actions
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Не отправлять Telegram-сообщения и не менять базу")
+    parser.add_argument("--include-seen", action="store_true",
+                        help="Проверить и ранее найденное (только вместе с --dry-run)")
+    parser.add_argument("--days", type=int, default=DAYS_BACK)
+    parser.add_argument("--langs", nargs="+", type=str.upper, choices=[lang for lang, _ in LANGS])
+    parser.add_argument("--json", type=Path, help="Сохранить результат и ошибки в JSON")
+    args = parser.parse_args(argv)
+    if args.days < 1:
+        parser.error("--days должен быть не меньше 1")
+    if args.include_seen and not args.dry_run:
+        parser.error("--include-seen разрешён только с --dry-run")
+    return args
 
-        results = await run_search(log)
-        # от старой новости к новой: читается в чате по хронологии
-        results.sort(key=lambda r: tuple(reversed(r["date"].split("."))))
 
-        for chat_id in CHAT_IDS:
-            try:
-                if not results:
-                    await bot.send_message(
-                        chat_id,
-                        "Плановый поиск: новых новостей иранских партнёров "
-                        "за последние 10 дней нет.",
-                    )
-                else:
-                    await bot.send_message(
-                        chat_id, f"Найдено новых новостей: {len(results)}")
-                    for item in results:
-                        await bot.send_message(chat_id, format_news(item))
-                        await asyncio.sleep(0.5)
-            except Exception as e:
-                # один недоступный получатель (не нажал Start, заблокировал
-                # бота, опечатка в id) не должен лишать сводки остальных
-                print(f"Не смог отправить получателю {chat_id}: {e}", flush=True)
-    finally:
-        await bot.session.close()
+async def main(args=None):
+    args = args or parse_args()
+    token = os.getenv("BOT_TOKEN")
+    chat_ids = list(dict.fromkeys(c.strip() for c in os.getenv("CHAT_ID", "").split(",") if c.strip()))
+    if not args.dry_run and (not token or not chat_ids):
+        raise SystemExit("Для отправки нужны BOT_TOKEN и CHAT_ID. Для проверки используй --dry-run.")
+
+    async def log(text):
+        print(text, flush=True)
+
+    report = await run_search(log, dry_run=args.dry_run, include_seen=args.include_seen,
+                              days_back=args.days, languages=args.langs)
+    await log(format_summary(report))
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(asdict(report), ensure_ascii=False, indent=2,
+                                        default=str), encoding="utf-8")
+    if args.dry_run:
+        for item in report.items:
+            await log(format_news(item))
+        failures = []
+    else:
+        from aiogram import Bot
+        bot = Bot(token=token)
+        try:
+            failures = await deliver_report(bot.send_message, chat_ids, report, log)
+        finally:
+            await bot.session.close()
+    for lang, errors in report.errors.items():
+        for error in errors:
+            await log(f"[{lang}] {error}")
+    return 1 if report.errors or failures else 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

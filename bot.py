@@ -1,57 +1,34 @@
 # -*- coding: utf-8 -*-
-"""
-Telegram-бот TV BRICS / Иран.
-Кнопка "Запустить поиск" -> обход всех языковых версий -> вывод в формате:
-
-Партнер: ...
-Дата: ...
-Заголовок: ...
-Ссылка: ...
-Язык: ...
-"""
-
+"""Telegram-бот TV BRICS / Иран с кнопкой запуска поиска."""
 import asyncio
 import os
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
-from scraper import run_search
+load_dotenv(Path(__file__).with_name(".env"))
 
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-PROXY = os.getenv("PROXY")  # например http://127.0.0.1:10809; пусто = без прокси
-if not TOKEN:
-    raise SystemExit("Нет токена! Создай файл .env со строкой BOT_TOKEN=твой_токен")
+from config import DAYS_BACK  # noqa: E402
+from delivery import deliver_report, format_news  # noqa: E402
+from scraper import run_search  # noqa: E402
 
 BTN_SEARCH = "🔍 Запустить поиск"
 keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_SEARCH)]],
-    resize_keyboard=True,
+    keyboard=[[KeyboardButton(text=BTN_SEARCH)]], resize_keyboard=True,
 )
-
 dp = Dispatcher()
-search_running = False  # защита от двойного нажатия
-
-
-def format_news(item: dict) -> str:
-    return (
-        f"Партнер: {item['partner']}\n"
-        f"Дата: {item['date']}\n"
-        f"Заголовок: {item['title']}\n"
-        f"Ссылка: {item['url']}\n"
-        f"Язык: {item['lang']}"
-    )
+search_running = False
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
-        "Привет! Я ищу на tvbrics.com новости иранских партнёров "
-        "за последние 10 дней (все языковые версии). "
-        "Уже найденное раньше не повторяю.\n\nЖми кнопку.",
+        f"Привет! Я ищу на tvbrics.com новости иранских партнёров "
+        f"за последние {DAYS_BACK} дней на шести языках. "
+        "Уже отправленные новости не повторяю. Нажми кнопку.",
         reply_markup=keyboard,
     )
 
@@ -64,36 +41,35 @@ async def cmd_search(message: Message):
         return
     search_running = True
     try:
-        await message.answer("Начинаю обход сайта, это займёт несколько минут...")
+        await message.answer("Начинаю поиск, это займёт несколько минут...")
 
-        async def log(text: str):
-            await message.answer(text)
+        async def log(text):
+            print(text, flush=True)
 
-        results = await run_search(log)
-        # от старой новости к новой: читается в чате по хронологии
-        results.sort(key=lambda r: tuple(reversed(r["date"].split("."))))
-
-        if not results:
-            await message.answer(
-                "Новых новостей иранских партнёров за последние 10 дней не нашёл."
-            )
-        else:
-            await message.answer(f"Готово! Новых новостей: {len(results)}")
-            for item in results:
-                await message.answer(format_news(item))
-                await asyncio.sleep(0.5)  # не упираться в лимиты Telegram
-    except Exception as e:
-        await message.answer(f"Что-то пошло не так: {e}")
+        report = await run_search(log)
+        failures = await deliver_report(message.bot.send_message, [message.chat.id], report, log)
+        if failures:
+            await message.answer("Часть подборки не удалось отправить. Повтори поиск: "
+                                 "подтверждённые сообщения повторяться не будут.")
+    except Exception as exc:
+        print(f"Ошибка поиска: {type(exc).__name__}: {exc}", flush=True)
+        await message.answer("Поиск завершился с ошибкой. Подробности есть в журнале запуска.")
     finally:
         search_running = False
 
 
 async def main():
-    session = AiohttpSession(proxy=PROXY) if PROXY else None
-    bot = Bot(token=TOKEN, session=session)
-    print(f"Бот запущен{' через прокси ' + PROXY if PROXY else ''}. "
-          "Нажми Ctrl+C для остановки.")
-    await dp.start_polling(bot)
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise SystemExit("Нет токена: создай .env со строкой BOT_TOKEN=твой_токен")
+    proxy = os.getenv("PROXY")
+    session = AiohttpSession(proxy=proxy) if proxy else None
+    bot = Bot(token=token, session=session)
+    print("Бот запущен. Нажми Ctrl+C для остановки.")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":

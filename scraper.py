@@ -1,229 +1,388 @@
 # -*- coding: utf-8 -*-
-"""
-Обход tvbrics.com под видом обычного пользователя (Playwright + Chromium).
+"""Новости Ирана через браузер и действующие элементы интерфейса TV BRICS.
 
-Логика на каждый язык:
-  1. Открыть ленту новостей.
-  2. Кликнуть "Страны-участницы" -> "Иран" (data-id=784184). Адрес НЕ меняется,
-     лента обновляется на лету, поэтому ждём обновления контейнера.
-  3. Читать карточки, жать "ЕЩЕ", пока даты не уйдут за 10 дней.
-  4. Каждую ещё не виденную статью открыть и проверить: есть ли в ней
-     ссылка на иранского партнёра (словарь PARTNERS в config.py).
+Фильтр, карточки и параметры пагинации читаются из актуального HTML.
+Ответы AJAX проверяются до разбора, проверка доступа останавливает поиск.
 """
 
 import asyncio
+import json
 import random
 import re
-from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlparse
+import unicodedata
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
-from playwright.async_api import async_playwright
+from bs4 import BeautifulSoup
+from playwright.async_api import Error as PlaywrightError, async_playwright
 
 import db
 from config import (
-    DAYS_BACK, HEADLESS, LANGS, MAX_MORE_CLICKS, PARTNERS,
-    PAUSE_MAX, PAUSE_MIN, SEL_CARD, SEL_CARD_TITLE, SEL_CARD_TOP,
-    SEL_COUNTRY_MENU, SEL_IRAN_ITEM, SEL_MORE_BTN,
+    DAYS_BACK, HEADLESS, IRAN_DATA_ID, IRAN_NAMES, LANGS, MAX_MORE_CLICKS, PARTNERS,
+    PAUSE_MAX, PAUSE_MIN, REQUEST_TIMEOUT, SITE_TIMEZONE,
 )
 
-DATE_RE = re.compile(r"(?<!\d)(\d{2})\.(\d{2})\.(\d{2,4})")
-# китайский и ISO-форматы: 26年06月11日 / 2026年06月08日 / 2026.06.08 / 2026-06-08
-DATE_RE_YMD = re.compile(r"(?<!\d)(\d{2,4})[.\-/年](\d{1,2})[.\-/月](\d{1,2})")
+
+class ScrapeError(RuntimeError):
+    """Сайт не удалось прочитать; это не означает отсутствие новостей."""
 
 
-async def human_pause():
-    """Пауза, как у живого человека: и естественно, и вежливо к сайту."""
-    await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+class AccessBlocked(ScrapeError):
+    """Доступ ограничен: не повторяем запрос и не меняем способ доступа."""
+
+
+@dataclass
+class Card:
+    title: str
+    url: str
+    date: datetime | None
+    raw_date: str = ""
+
+
+@dataclass
+class Pagination:
+    url: str
+    filters: dict
+    page: int
+    showby: int
+
+    def form(self):
+        result = {f"filter[{key}]": str(value) for key, value in self.filters.items()}
+        result.update(page=str(self.page), showby=str(self.showby))
+        return result
+
+
+@dataclass
+class SearchReport:
+    date_from: date
+    date_to: date
+    items: list[dict] = field(default_factory=list)
+    errors: dict[str, list[str]] = field(default_factory=dict)
+    completed_languages: list[str] = field(default_factory=list)
+    checked_articles: int = 0
+
+    def add_error(self, lang, message):
+        self.errors.setdefault(lang, []).append(str(message))
 
 
 def parse_card_date(text: str):
-    """Достаёт дату: 08.06.26 / 08.06.2026 / 2026.06.08 / 2026年06月08日."""
-    text = text or ""
-    m = DATE_RE.search(text)
-    if m:
-        d, mo, y = m.groups()
-    else:
-        m = DATE_RE_YMD.search(text)
-        if not m:
-            return None
-        y, mo, d = m.groups()
-    y = int(y)
-    if y < 100:
-        y += 2000
-    elif y > 2099:  # склейка даты со временем: "07.06.2610" = 07.06.26 + 10:30
-        y = 2000 + int(str(y)[:2])
-    try:
-        return datetime(y, int(mo), int(d))
-    except ValueError:
-        return None
-
-
-async def extract_cards(page, base_url):
-    """Собирает с текущей страницы все карточки: (заголовок, ссылка, дата)."""
-    raw = await page.eval_on_selector_all(
-        SEL_CARD,
-        """(cards, args) => cards.map(c => {
-            const name = c.querySelector(args.title);
-            const a = name ? name.querySelector('a') : c.querySelector('a');
-            const top = c.querySelector(args.top);
-            let dateText = '';
-            if (top) {
-                for (const n of top.childNodes) {
-                    if (n.nodeType === 3 && n.textContent.trim()) {
-                        dateText = n.textContent.trim();
-                        break;
-                    }
-                }
-                if (!dateText) dateText = top.textContent.trim();
-            }
-            return {
-                title: name ? name.textContent.trim() : '',
-                href: a ? a.getAttribute('href') : '',
-                top: dateText
-            };
-        })""",
-        {"title": SEL_CARD_TITLE, "top": SEL_CARD_TOP},
+    """ДД.ММ.ГГ, ДД.ММ.ГГГГ, ISO и китайская дата; без догадок о годе."""
+    text = "".join(str(unicodedata.decimal(c)) if c.isdecimal() else c
+                   for c in (text or ""))
+    patterns = (
+        (r"(?<!\d)(\d{2,4})年\s*(\d{1,2})月\s*(\d{1,2})日", True),
+        (r"(?<!\d)(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)", True),
+        (r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)", False),
     )
-    cards, seen_urls = [], set()
-    for item in raw:
-        if not item["href"] or not item["title"]:
+    for pattern, year_first in patterns:
+        match = re.search(pattern, text)
+        if not match:
             continue
-        url = urljoin(base_url, item["href"])
-        if url in seen_urls:
-            continue  # одна новость встречается и в слайдере, и в ленте
-        seen_urls.add(url)
-        cards.append({"title": item["title"], "url": url,
-                      "date": parse_card_date(item["top"]),
-                      "raw_top": item["top"]})
-    return cards
+        a, b, c = map(int, match.groups())
+        year, month, day = (a, b, c) if year_first else (c, b, a)
+        if year < 100:
+            year += 2000
+        try:
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+    return None
 
 
-async def find_partners_in_article(page, url):
-    """Открывает статью и возвращает имена партнёров по доменам ссылок."""
-    await page.goto(url, wait_until="domcontentloaded")
-    await human_pause()
-    hrefs = await page.eval_on_selector_all(
-        "a[href]", "els => els.map(e => e.href)"
-    )
+def search_window(days_back=DAYS_BACK, now=None):
+    if days_back < 1:
+        raise ValueError("Число дней должно быть не меньше 1")
+    zone = ZoneInfo(SITE_TIMEZONE)
+    now = now or datetime.now(zone)
+    if now.tzinfo is not None:
+        now = now.astimezone(zone)
+    today = now.date()
+    return today - timedelta(days=days_back - 1), today
+
+
+def site_url(base, href):
+    value = urlsplit(urljoin(base, href))
+    if (value.scheme not in {"http", "https"}
+            or value.hostname not in {"tvbrics.com", "www.tvbrics.com"}
+            or value.username or value.password):
+        raise ScrapeError("В разметке найден неожиданный адрес вместо TV BRICS")
+    return urlunsplit((value.scheme, value.netloc, value.path, value.query, ""))
+
+
+def parse_country_filter(content, base_url):
+    soup = BeautifulSoup(content, "html.parser")
+    for block in soup.select(".filter-items[data-url]"):
+        for item in block.select(".js_filter_country[data-id]"):
+            name = item.get_text(" ", strip=True).casefold()
+            if name in IRAN_NAMES or item.get("data-id") == IRAN_DATA_ID:
+                return (site_url(base_url, block["data-url"]),
+                        {"id": item["data-id"], "section": item.get("data-section", "")})
+    raise ScrapeError("Не найден фильтр Ирана в новой разметке сайта")
+
+
+def parse_feed(content, base_url, *, fragment=False):
+    """Читаем ответ фильтра/пагинации либо его блок в полной странице."""
+    soup = BeautifulSoup(content, "html.parser")
+    root = soup.select_one("#filter_news_list")
+    if root is None:
+        if not fragment:
+            raise ScrapeError("Не найден контейнер отфильтрованных новостей")
+        root = soup
+    cards, seen = [], set()
+    for node in root.select("a.news-card[href]"):
+        title_node = node.select_one(".news-card__title")
+        date_node = node.select_one(".head-news-card__date")
+        if title_node is None:
+            raise ScrapeError("Карточка новости не содержит заголовок")
+        url = site_url(base_url, node["href"])
+        parts = urlsplit(url)
+        if not re.fullmatch(r"/(?:en/|cn/|pt/|es/|ar/)?news/[^/]+/?", parts.path):
+            raise ScrapeError("В ленте обнаружена карточка с неожиданным адресом")
+        url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        if url in seen:
+            continue
+        seen.add(url)
+        raw = date_node.get_text(" ", strip=True) if date_node else ""
+        cards.append(Card(title_node.get_text(" ", strip=True), url,
+                          parse_card_date(raw), raw))
+    more = root.select_one(".js_news_list_show_more")
+    pagination = None
+    if more:
+        try:
+            filters = json.loads(more["data-filter"])
+            if not isinstance(filters, dict):
+                raise ValueError("filter должен быть объектом")
+            pagination = Pagination(site_url(base_url, more["data-url"]), filters,
+                                    int(more["data-page"]), int(more["data-showby"]))
+            if pagination.page < 1 or pagination.showby < 1:
+                raise ValueError("Неверный номер страницы или размер страницы")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ScrapeError("Не удалось прочитать параметры следующей страницы") from exc
+    return cards, pagination
+
+
+def partner_names(hrefs):
     found = []
     for href in hrefs:
-        domain = urlparse(href).netloc.lower().removeprefix("www.")
-        for partner_domain, partner_name in PARTNERS.items():
-            if domain == partner_domain or domain.endswith("." + partner_domain):
-                if partner_name not in found:
-                    found.append(partner_name)
+        try:
+            parts = urlsplit(href)
+            if parts.scheme not in {"http", "https"}:
+                continue
+            host = (parts.hostname or "").lower().rstrip(".")
+        except ValueError:
+            continue
+        for domain, name in PARTNERS.items():
+            if host == domain or host.endswith("." + domain):
+                if name not in found:
+                    found.append(name)
     return found
 
 
-async def collect_language(context, lang, url, cutoff, log):
-    """Полный проход по одной языковой версии. Возвращает список находок."""
-    page = await context.new_page()
-    results = []
-    try:
-        await log(f"[{lang}] Открываю {url}")
-        await page.goto(url, wait_until="domcontentloaded")
-        await human_pause()
-
-        # --- фильтр "Страны-участницы" -> "Иран" -----------------------
-        menu = page.locator(SEL_COUNTRY_MENU).first
-        if await menu.count() == 0:
-            await log(f"[{lang}] Не нашёл кнопку 'Страны-участницы' — пропускаю язык. "
-                      f"Нужно проверить селекторы этой версии через DevTools.")
-            return results
-        await menu.click()
-        await human_pause()
-
-        iran = page.locator(SEL_IRAN_ITEM).first
-        if await iran.count() == 0:
-            await log(f"[{lang}] Не нашёл пункт 'Иран' (data-id) — пропускаю язык.")
-            return results
-        prev_html_len = len(await page.content())
-        await iran.click()
-        # адрес не меняется: просто даём AJAX время перерисовать ленту
-        await page.wait_for_timeout(2500)
-        await human_pause()
-
-        # --- листаем ленту кнопкой "ЕЩЕ" до глубины DAYS_BACK ----------
-        prev_count = None
-        for click_n in range(MAX_MORE_CLICKS + 1):
-            cards = await extract_cards(page, url)
-            dated = [c for c in cards if c["date"]]
-            oldest = min((c["date"] for c in dated), default=None)
-            if oldest:
-                await log(f"[{lang}] Вижу карточек: {len(cards)}; "
-                          f"самая старая: {oldest:%d.%m.%Y}")
-            else:
-                sample = cards[0]["raw_top"] if cards else ""
-                await log(f"[{lang}] Вижу карточек: {len(cards)}; дат не "
-                          f"распознал (пример сырой даты: {sample!r})")
-
-            if oldest and oldest < cutoff:
-                break  # дошли до новостей старше 10 дней
-
-            if prev_count is not None and len(cards) <= prev_count:
-                await log(f"[{lang}] После 'ЕЩЕ' новых карточек не появилось — "
-                          "останавливаюсь. Похоже, бот не видит подгружаемую "
-                          "часть ленты, нужна сверка селекторов.")
-                break
-            prev_count = len(cards)
-
-            more = page.locator(SEL_MORE_BTN).first
-            if await more.count() == 0 or not await more.is_visible():
-                break  # кнопки "ЕЩЕ" больше нет — лента кончилась
-            await more.scroll_into_view_if_needed()
-            await more.click()
-            await page.wait_for_timeout(2000)
-            await human_pause()
-
-        # --- отбор: свежие, не виденные, с партнёрской ссылкой ---------
-        fresh = [c for c in cards if c["date"] and c["date"] >= cutoff]
-        new_cards = [c for c in fresh if not db.is_seen(c["url"])]
-        await log(f"[{lang}] За {DAYS_BACK} дн.: {len(fresh)} новостей, "
-                  f"из них новых: {len(new_cards)}. Проверяю партнёров...")
-
-        article_page = await context.new_page()
-        for c in new_cards:
-            partners = await find_partners_in_article(article_page, c["url"])
-            if partners:
-                partner_str = ", ".join(partners)
-                results.append({
-                    "partner": partner_str,
-                    "date": c["date"].strftime("%d.%m.%Y"),
-                    "title": c["title"],
-                    "url": c["url"],
-                    "lang": lang,
-                })
-                db.mark_seen(c["url"], lang, c["title"], partner_str,
-                             c["date"].strftime("%d.%m.%Y"))
-            else:
-                # статья без партнёрской ссылки: тоже запоминаем,
-                # чтобы в следующий раз не открывать её заново
-                db.mark_seen(c["url"], lang, c["title"], "", 
-                             c["date"].strftime("%d.%m.%Y"))
-        await article_page.close()
-    finally:
-        await page.close()
-    return results
+def parse_article(content, url):
+    soup = BeautifulSoup(content, "html.parser")
+    body = soup.select_one(".news-detail-content, [itemprop='articleBody']")
+    title = soup.select_one("h1")
+    if body is None or title is None or not body.get_text(strip=True):
+        raise ScrapeError("Не найден текст или заголовок статьи: " + url)
+    names = partner_names(urljoin(url, a["href"]) for a in body.select("a[href]"))
+    return title.get_text(" ", strip=True), names
 
 
-async def run_search(log):
-    """Главная точка входа. log — async-функция для сообщений о ходе работы."""
-    if len(PARTNERS) <= 1:
-        await log("⚠️ В config.py заполнен только пример партнёра. "
-                  "Не забудь добавить остальные домены в словарь PARTNERS.")
-    cutoff = datetime.now() - timedelta(days=DAYS_BACK)
-    all_results = []
+def check_response(status, content, url):
+    if (status in {401, 403, 429}
+            or "/.well-known/ddos-guard/js-challenge/" in content
+            or "Checking your browser before accessing" in content):
+        raise AccessBlocked(f"Сайт ограничил доступ или запросил проверку браузера "
+                            f"(HTTP {status}): {url}. Поиск остановлен.")
+    if status != 200:
+        raise ScrapeError(f"HTTP {status}: {url}")
+
+
+class BrowserSource:
+    """Открывает ленту и статьи в Chromium, ожидает ответы после кликов."""
+
+    def __init__(self, context):
+        self.context = context
+        self.feed_page = None
+        self.article_page = None
+
+    async def _response_text(self, response):
+        if response is None:
+            raise ScrapeError("Браузер не получил ответ сайта")
+        site_url(response.url, response.url)
+        content = await response.text()
+        check_response(response.status, content, response.url)
+        return content
+
+    async def fetch(self, url, *, data=None):
+        if data is None:
+            is_feed = url in {address for _, address in LANGS}
+            attr = "feed_page" if is_feed else "article_page"
+            page = getattr(self, attr)
+            if page is None:
+                page = await self.context.new_page()
+                setattr(self, attr, page)
+            response = await page.goto(url, wait_until="domcontentloaded")
+            await self._response_text(response)
+            content = await page.content()
+            check_response(200, content, url)
+            if is_feed:
+                consent = page.locator(".js-cookie_confirm").first
+                if await consent.is_visible():
+                    await consent.click()
+                    await page.locator(".confirm_cookie").wait_for(state="hidden")
+            return content
+
+        page = self.feed_page
+        if page is None:
+            raise ScrapeError("Лента ещё не открыта")
+        matches = lambda r: r.request.method == "POST" and r.url == url
+        if "id" in data:
+            if not str(data["id"]).isdigit():
+                raise ScrapeError("Некорректный ID страны")
+            selector = f'.js_filter_country[data-id="{data["id"]}"]'
+            iran = page.locator(".filter-items " + selector).first
+            if not await iran.is_visible():
+                menu = page.locator("li.js-toggle-active-click").filter(
+                    has=page.locator(selector)).first
+                await menu.locator(":scope > span").click()
+            async with page.expect_response(matches) as response_info:
+                await iran.click()
+            content = await self._response_text(await response_info.value)
+            await page.locator(".filter-items " + selector + ".active").wait_for(state="attached")
+        else:
+            more = page.locator("#filter_news_list .js_news_list_show_more").first
+            if await more.get_attribute("data-page") != str(data["page"]):
+                raise ScrapeError("Номер следующей страницы в браузере не совпал с ожидаемым")
+            async with page.expect_response(matches) as response_info:
+                await more.click()
+            content = await self._response_text(await response_info.value)
+            next_page = int(data["page"]) + 1
+            await page.locator(f'.js_news_list_show_more[data-page="{next_page}"]').wait_for(state="attached")
+        return content
+
+
+@asynccontextmanager
+async def browser_source():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context(
-            locale="ru-RU",
-            viewport={"width": 1366, "height": 850},
-        )
+        try:
+            context = await browser.new_context(locale="ru-RU", viewport={"width": 1366, "height": 850})
+            context.set_default_timeout(REQUEST_TIMEOUT * 1000)
+            yield BrowserSource(context)
+        finally:
+            await browser.close()
+
+
+async def fetch_html(source, url, *, data=None):
+    try:
+        return await source.fetch(url, data=data)
+    except PlaywrightError as exc:
+        raise ScrapeError(f"Не удалось прочитать {url}: {type(exc).__name__}") from exc
+
+
+async def collect_language(session, lang, url, report, log, *, dry_run=False,
+                           include_seen=False):
+    await log(f"[{lang}] Открываю ленту и выбираю Иран")
+    endpoint, form = parse_country_filter(await fetch_html(session, url), url)
+    content = await fetch_html(session, endpoint, data=form)
+    cards, pagination = parse_feed(content, url, fragment=True)
+    if not cards:
+        raise ScrapeError("Фильтр вернул страницу без карточек; результат поиска не подтверждён")
+    if pagination and str(pagination.filters.get("PROPERTY_COUNTRY_ITEMS")) != form["id"]:
+        raise ScrapeError("Фильтр следующей страницы не соответствует Ирану")
+
+    candidates, collected = {}, set()
+    for page_index in range(MAX_MORE_CLICKS + 1):
+        new_cards = [card for card in cards if card.url not in collected]
+        if not new_cards:
+            report.add_error(lang, "Следующая страница не добавила новостей; обход неполный")
+            break
+        for card in new_cards:
+            collected.add(card.url)
+            if card.date is None:
+                report.add_error(lang, f"Не распознана дата {card.raw_date!r}: {card.url}")
+            elif report.date_from <= card.date.date() <= report.date_to:
+                candidates[card.url] = card
+        # Одна старая закреплённая карточка не должна останавливать обход.
+        if all(c.date is not None and c.date.date() < report.date_from for c in new_cards):
+            break
+        if pagination is None:
+            break
+        if page_index == MAX_MORE_CLICKS:
+            report.add_error(lang, "Достигнут предел страниц; поиск может быть неполным")
+            break
+        await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+        try:
+            next_content = await fetch_html(session, pagination.url, data=pagination.form())
+            cards, _ = parse_feed(next_content, url, fragment=True)
+        except AccessBlocked:
+            raise
+        except (ScrapeError, UnicodeError) as exc:
+            report.add_error(lang, str(exc))
+            break
+        if not cards:
+            report.add_error(lang, "Следующая страница не содержит карточек; конец ленты не подтверждён")
+            break
+        pagination.page += 1
+
+    fresh = list(candidates.values())
+    pending = [c for c in fresh if include_seen or not db.is_seen(c.url)]
+    await log(f"[{lang}] За период: {len(fresh)}, ещё не обработано: {len(pending)}")
+    for card in pending:
+        try:
+            await asyncio.sleep(random.uniform(PAUSE_MIN, PAUSE_MAX))
+            title, partners = parse_article(await fetch_html(session, card.url), card.url)
+            report.checked_articles += 1
+            news_date = card.date.strftime("%d.%m.%Y")
+            if partners:
+                report.items.append({"partner": ", ".join(partners), "date": news_date,
+                                     "title": title, "url": card.url, "lang": lang})
+            elif not dry_run:
+                db.mark_seen(card.url, lang, title, "", news_date)
+        except AccessBlocked:
+            raise
+        except (ScrapeError, UnicodeError) as exc:
+            report.add_error(lang, str(exc))
+            await log(f"[{lang}] Ошибка статьи: {exc}")
+    if lang not in report.errors:
+        report.completed_languages.append(lang)
+
+
+async def run_search(log, *, dry_run=False, include_seen=False, days_back=DAYS_BACK,
+                     languages=None, now=None, source=None):
+    start, end = search_window(days_back, now)
+    report = SearchReport(start, end)
+    requested = set(languages) if languages is not None else {lang for lang, _ in LANGS}
+    unknown = requested - {lang for lang, _ in LANGS}
+    if unknown or not requested:
+        raise ValueError("Укажи языки из списка: " + ", ".join(lang for lang, _ in LANGS))
+    await log(f"Период: {start:%d.%m.%Y}–{end:%d.%m.%Y} ({SITE_TIMEZONE})")
+    async def collect_all(session):
+        blocked = False
         for lang, url in LANGS:
+            if lang not in requested:
+                continue
+            if blocked:
+                report.add_error(lang, "Не проверено: сайт ограничил доступ, обход остановлен")
+                continue
             try:
-                found = await collect_language(context, lang, url, cutoff, log)
-                all_results.extend(found)
-            except Exception as e:  # один сломавшийся язык не валит весь поиск
-                await log(f"[{lang}] Ошибка: {e}")
-        await browser.close()
-    return all_results
+                await collect_language(session, lang, url, report, log,
+                                       dry_run=dry_run, include_seen=include_seen)
+            except AccessBlocked as exc:
+                blocked = True
+                report.add_error(lang, str(exc))
+                await log(f"[{lang}] {exc}")
+            except Exception as exc:
+                report.add_error(lang, str(exc))
+                await log(f"[{lang}] Ошибка сбора: {exc}")
+    if source is not None:
+        await collect_all(source)
+    else:
+        async with browser_source() as session:
+            await collect_all(session)
+    report.items.sort(key=lambda r: (datetime.strptime(r["date"], "%d.%m.%Y"), r["lang"], r["url"]))
+    return report
