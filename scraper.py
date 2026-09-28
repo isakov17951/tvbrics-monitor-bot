@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import logging
 import random
 import re
 import unicodedata
@@ -18,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 from playwright.async_api import Error as PlaywrightError, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import db
 from config import (
@@ -208,11 +210,31 @@ class BrowserSource:
         self.context = context
         self.feed_page = None
         self.article_page = None
+        self.stage = "подготовка браузера"
+
+    async def _navigate(self, page, url):
+        for attempt in (1, 2):
+            self.stage = f"открытие страницы, попытка {attempt}/2"
+            try:
+                return await page.goto(url, wait_until="domcontentloaded")
+            except PlaywrightTimeoutError:
+                if attempt == 2:
+                    raise
+                # Не повторяем запрос, если уже появилась проверка доступа.
+                try:
+                    content = await page.content()
+                except PlaywrightError:
+                    content = ""
+                check_response(200, content, url)
+                logging.getLogger(__name__).warning(
+                    "Тайм-аут открытия %s; повтор через 3 секунды", url)
+                await asyncio.sleep(3)
 
     async def _response_text(self, response):
         if response is None:
             raise ScrapeError("Браузер не получил ответ сайта")
         site_url(response.url, response.url)
+        self.stage = "чтение ответа сайта"
         content = await response.text()
         check_response(response.status, content, response.url)
         return content
@@ -223,13 +245,16 @@ class BrowserSource:
             attr = "feed_page" if is_feed else "article_page"
             page = getattr(self, attr)
             if page is None:
+                self.stage = "создание вкладки"
                 page = await self.context.new_page()
                 setattr(self, attr, page)
-            response = await page.goto(url, wait_until="domcontentloaded")
+            response = await self._navigate(page, url)
             await self._response_text(response)
+            self.stage = "чтение HTML страницы"
             content = await page.content()
             check_response(200, content, url)
             if is_feed:
+                self.stage = "закрытие уведомления о cookie"
                 consent = page.locator(".js-cookie_confirm").first
                 if await consent.is_visible():
                     await consent.click()
@@ -241,6 +266,7 @@ class BrowserSource:
             raise ScrapeError("Лента ещё не открыта")
         matches = lambda r: r.request.method == "POST" and r.url == url
         if "id" in data:
+            self.stage = "открытие списка стран"
             if not str(data["id"]).isdigit():
                 raise ScrapeError("Некорректный ID страны")
             selector = f'.js_filter_country[data-id="{data["id"]}"]'
@@ -249,18 +275,23 @@ class BrowserSource:
                 menu = page.locator("li.js-toggle-active-click").filter(
                     has=page.locator(selector)).first
                 await menu.locator(":scope > span").click()
+            self.stage = "выбор Ирана и ожидание ответа фильтра"
             async with page.expect_response(matches) as response_info:
                 await iran.click()
             content = await self._response_text(await response_info.value)
+            self.stage = "ожидание активного фильтра Ирана"
             await page.locator(".filter-items " + selector + ".active").wait_for(state="attached")
         else:
+            self.stage = "проверка кнопки следующей страницы"
             more = page.locator("#filter_news_list .js_news_list_show_more").first
             if await more.get_attribute("data-page") != str(data["page"]):
                 raise ScrapeError("Номер следующей страницы в браузере не совпал с ожидаемым")
+            self.stage = "загрузка следующей страницы новостей"
             async with page.expect_response(matches) as response_info:
                 await more.click()
             content = await self._response_text(await response_info.value)
             next_page = int(data["page"]) + 1
+            self.stage = "ожидание обновления номера страницы"
             await page.locator(f'.js_news_list_show_more[data-page="{next_page}"]').wait_for(state="attached")
         return content
 
@@ -281,7 +312,12 @@ async def fetch_html(source, url, *, data=None):
     try:
         return await source.fetch(url, data=data)
     except PlaywrightError as exc:
-        raise ScrapeError(f"Не удалось прочитать {url}: {type(exc).__name__}") from exc
+        stage = getattr(source, "stage", "чтение сайта")
+        details = str(exc).strip()[:1500]
+        raise ScrapeError(
+            f"Не удалось прочитать {url}; этап: {stage}; "
+            f"{type(exc).__name__}: {details}"
+        ) from exc
 
 
 async def collect_language(session, lang, url, report, log, *, dry_run=False,
