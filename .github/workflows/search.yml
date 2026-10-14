@@ -37,6 +37,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          PROXY: ${{ secrets.PROXY }}
         run: python search_once.py
 
       - name: Сохранить базу найденного и подтверждения доставки
