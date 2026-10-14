@@ -8,6 +8,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import unicodedata
@@ -299,7 +300,14 @@ class BrowserSource:
 @asynccontextmanager
 async def browser_source():
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=HEADLESS)
+        # PROXY (например, http://user:pass@host:port) нужен, если сайт
+        # блокирует IP-адрес сервера напрямую, как адреса GitHub Actions.
+        proxy = os.getenv("PROXY")
+        launch_kwargs = {"headless": HEADLESS}
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+            logging.getLogger(__name__).info("Браузер сборщика использует прокси")
+        browser = await pw.chromium.launch(**launch_kwargs)
         try:
             context = await browser.new_context(locale="ru-RU", viewport={"width": 1366, "height": 850})
             context.set_default_timeout(REQUEST_TIMEOUT * 1000)
